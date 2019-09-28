@@ -1,0 +1,3 @@
+pgtsql.so
+src/*.o
+src/pl_gram.*
