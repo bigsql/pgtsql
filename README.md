@@ -1,12 +1,18 @@
 # pgTSQL
 
 ## Overview
+Transact-SQL is now available in PostgreSQL (in addition to Sybase & SQL Server).
 
-pgTSQL is an extension that provides a PostgreSQL procedural language that
-implements the Transact-SQL language. Additionally, the extension provides a 
-number of built-in functions that are compatible with Sybase and SQL Server.
 
-T-SQL (Transact-SQL) is the procedural programming language built into Sybase & SQL Server. It's functionally the equivalent of PostgreSQL's PL/pgSQL. It looks a bit odd because it has unique conventions like:
+pgTSQL is an extension that provides:
+
+* PostgreSQL procedural language that implements the Transact-SQL language. 
+* Built-in functions, such as getdate() and isnull()
+* System catalog views, such as SYS.TABLES and SYS.OBJECTS
+
+T-SQL (Transact-SQL) is the procedural programming language built into Sybase & SQL Server. 
+It's functionally the equivalent of PostgreSQL's PL/pgSQL. It looks a bit different
+because it has unique conventions like:
 
 * Semicolons are not required at the end of each line of code
 * Variable names always are prefixed with @ signs 
@@ -28,7 +34,7 @@ Now lets use psql to create a table and a small sample TSQL function as follows.
 	CREATE TABLE rdbms_supports_tsql (
 	  organization  varchar(10) primary key
 	);
- 	NSERT INTO rdbms_supports_tsql VALUES ('SYBASE');
+ 	INSERT INTO rdbms_supports_tsql VALUES ('SYBASE');
 	INSERT INTO rdbms_supports_tsql VALUES ('SQL-SERVER');
 	INSERT INTO rdbms_supports_tsql VALUES ('POSTGRES') ;
   
