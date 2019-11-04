@@ -19,6 +19,13 @@ because it has unique conventions like:
 * IF statements do not need to be closed by END IF's     
 * Temporary tables are automagic if the table name has a # prefix
 
+## History of project
+This project was originally part of an OpenSCG  PostgreSQL distribution call tPostgres that 
+fizzled about seven years ago.  Five years ago Jim Mlodgenski ported it as a standalone extension
+for PG95 BigSQL.   Earlier in 2019 Denis Lussier upgraded it to suport PG 9.6 & PG 10.
+Now Korry Douglas is working to get it running properly with PG 11 (including support for stored 
+procedures instead of just stored functions) and then PG 12.
+
 
 ## Installation
 Use the BigSQL command line to install PostgreSQL 10 and then the pgtsql extension
