@@ -122,7 +122,7 @@ pltsql_call_handler(PG_FUNCTION_ARGS)
 			retval = PointerGetDatum(pltsql_exec_trigger(func,
 										   (TriggerData *) fcinfo->context));
 		else
-			retval = pltsql_exec_function(func, fcinfo);
+			retval = pltsql_exec_function(func, fcinfo, NULL);
 	}
 	PG_CATCH();
 	{
@@ -161,6 +161,7 @@ pltsql_inline_handler(PG_FUNCTION_ARGS)
 	PLTSQL_function *func;
 	FunctionCallInfoData fake_fcinfo;
 	FmgrInfo	flinfo;
+	EState	   *simple_eval_estate;
 	Datum		retval;
 	int			rc;
 
@@ -189,7 +190,10 @@ pltsql_inline_handler(PG_FUNCTION_ARGS)
 	flinfo.fn_oid = InvalidOid;
 	flinfo.fn_mcxt = CurrentMemoryContext;
 
-	retval = pltsql_exec_function(func, &fake_fcinfo);
+	/* Create a private EState for simple-expression execution */
+	simple_eval_estate = CreateExecutorState();
+
+	retval = pltsql_exec_function(func, &fake_fcinfo, simple_eval_estate);
 
 	/* Function should now have no remaining use-counts ... */
 	func->use_count--;

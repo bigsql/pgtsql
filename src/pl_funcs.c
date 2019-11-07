@@ -1123,15 +1123,11 @@ dump_fetch(PLTSQL_stmt_fetch *stmt)
 		dump_cursor_direction(stmt);
 
 		dump_indent += 2;
-		if (stmt->rec != NULL)
+		if (stmt->target != NULL)
 		{
 			dump_ind();
-			printf("    target = %d %s\n", stmt->rec->dno, stmt->rec->refname);
-		}
-		if (stmt->row != NULL)
-		{
-			dump_ind();
-			printf("    target = %d %s\n", stmt->row->dno, stmt->row->refname);
+			printf("    target = %d %s\n",
+				   stmt->target->dno, stmt->target->refname);
 		}
 		dump_indent -= 2;
 	}
@@ -1335,19 +1331,12 @@ dump_execsql(PLTSQL_stmt_execsql *stmt)
 	printf("\n");
 
 	dump_indent += 2;
-	if (stmt->rec != NULL)
+	if (stmt->target != NULL)
 	{
 		dump_ind();
 		printf("    INTO%s target = %d %s\n",
 			   stmt->strict ? " STRICT" : "",
-			   stmt->rec->dno, stmt->rec->refname);
-	}
-	if (stmt->row != NULL)
-	{
-		dump_ind();
-		printf("    INTO%s target = %d %s\n",
-			   stmt->strict ? " STRICT" : "",
-			   stmt->row->dno, stmt->row->refname);
+			   stmt->target->dno, stmt->target->refname);
 	}
 	dump_indent -= 2;
 }
@@ -1361,19 +1350,12 @@ dump_dynexecute(PLTSQL_stmt_dynexecute *stmt)
 	printf("\n");
 
 	dump_indent += 2;
-	if (stmt->rec != NULL)
+	if (stmt->target != NULL)
 	{
 		dump_ind();
 		printf("    INTO%s target = %d %s\n",
 			   stmt->strict ? " STRICT" : "",
-			   stmt->rec->dno, stmt->rec->refname);
-	}
-	if (stmt->row != NULL)
-	{
-		dump_ind();
-		printf("    INTO%s target = %d %s\n",
-			   stmt->strict ? " STRICT" : "",
-			   stmt->row->dno, stmt->row->refname);
+			   stmt->target->dno, stmt->target->refname);
 	}
 	if (stmt->params != NIL)
 	{

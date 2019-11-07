@@ -20,6 +20,7 @@
 #include "access/xact.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
+#include "utils/expandedrecord.h"
 
 /**********************************************************************
  * Definitions
@@ -165,9 +166,11 @@ typedef struct
 	int			ttype;			/* PLTSQL_TTYPE_ code */
 	int16		typlen;			/* stuff copied from its pg_type entry */
 	bool		typbyval;
+	char		typtype;
 	Oid			typrelid;
 	Oid			typioparam;
 	Oid			collation;		/* from pg_type, but can be overridden */
+	bool		typisarray;		/* is "true" array, or domain over one */
 	FmgrInfo	typinput;		/* lookup info for typinput function */
 	int32		atttypmod;		/* typmod (taken from someplace else) */
 } PLTSQL_type;
@@ -202,6 +205,7 @@ typedef struct PLTSQL_expr
 	char	   *query;
 	SPIPlanPtr	plan;
 	Bitmapset  *paramnos;		/* all dnos referenced by this query */
+	int			rwparam;		/* dno of read/write param, or -1 if none */
 
 	/* function containing this expr (not set until we first parse query) */
 	struct PLTSQL_function *func;
@@ -213,6 +217,7 @@ typedef struct PLTSQL_expr
 	Expr	   *expr_simple_expr;		/* NULL means not a simple expr */
 	int			expr_simple_generation; /* plancache generation we checked */
 	Oid			expr_simple_type;		/* result type Oid, if simple */
+	int32		expr_simple_typmod; /* result typmod, if simple */
 
 	/*
 	 * if expr is simple AND prepared in current transaction,
@@ -275,11 +280,24 @@ typedef struct
 	int			dno;
 	char	   *refname;
 	int			lineno;
+	bool		notnull;
+
+	PLTSQL_type *datatype;		/* can be NULL, if rectypeid is RECORDOID */
+	Oid			rectypeid;		/* declared type of variable */
 
 	HeapTuple	tup;
 	TupleDesc	tupdesc;
 	bool		freetup;
 	bool		freetupdesc;
+
+	/* RECFIELDs for this record are chained together for easy access */
+	int			firstfield;		/* dno of first RECFIELD, or -1 if none */
+
+	/* Fields below here can change at runtime */
+
+	/* We always store record variables as "expanded" records */
+	ExpandedRecordHeader *erh;
+
 } PLTSQL_rec;
 
 
@@ -289,6 +307,10 @@ typedef struct
 	int			dno;
 	char	   *fieldname;
 	int			recparentno;	/* dno of parent record */
+	int			nextfield;		/* dno of next child, or -1 if none */
+	uint64		rectupledescid; /* record's tupledesc ID as of last lookup */
+	ExpandedRecordFieldInfo finfo;	/* field's attnum and type info */
+	/* if rectupledescid == INVALID_TUPLEDESC_IDENTIFIER, finfo isn't valid */
 } PLTSQL_recfield;
 
 
@@ -471,8 +493,7 @@ typedef struct
 	int			cmd_type;
 	int			lineno;
 	char	   *label;
-	PLTSQL_rec *rec;
-	PLTSQL_row *row;
+	PLTSQL_variable *var;
 	List	   *body;			/* List of statements */
 } PLTSQL_stmt_forq;
 
@@ -545,8 +566,7 @@ typedef struct
 {								/* FETCH or MOVE statement */
 	int			cmd_type;
 	int			lineno;
-	PLTSQL_rec *rec;			/* target, as record or row */
-	PLTSQL_row *row;
+	PLTSQL_variable *target;	/* assign target */
 	int			curvar;			/* cursor variable to fetch from */
 	FetchDirection direction;	/* fetch direction */
 	long		how_many;		/* count, if constant (expr is NULL) */
@@ -626,8 +646,7 @@ typedef struct
 	/* note: mod_stmt is set when we plan the query */
 	bool		into;			/* INTO supplied? */
 	bool		strict;			/* INTO STRICT flag */
-	PLTSQL_rec *rec;			/* INTO target, if record */
-	PLTSQL_row *row;			/* INTO target, if row */
+	PLTSQL_variable *target;	/* INTO target */
 } PLTSQL_stmt_execsql;
 
 
@@ -638,8 +657,7 @@ typedef struct
 	PLTSQL_expr *query;		/* string expression */
 	bool		into;			/* INTO supplied? */
 	bool		strict;			/* INTO STRICT flag */
-	PLTSQL_rec *rec;			/* INTO target, if record */
-	PLTSQL_row *row;			/* INTO target, if row */
+	PLTSQL_variable *target;	/* INTO target */
 	List	   *params;			/* USING expressions */
 } PLTSQL_stmt_dynexecute;
 
@@ -737,13 +755,14 @@ typedef struct PLTSQL_execstate
 	bool		retisset;
 
 	bool		readonly_func;
-
+	bool		atomic;
 	TupleDesc	rettupdesc;
 	char	   *exitlabel;		/* the "target" label of the current EXIT or
 								 * CONTINUE stmt, if any */
 	ErrorData  *cur_error;		/* current exception handler's error */
 
 	Tuplestorestate *tuple_store;		/* SRFs accumulate results here */
+	TupleDesc	tuple_store_desc;	/* descriptor for tuples in tuple_store */
 	MemoryContext tuple_store_cxt;
 	ResourceOwner tuple_store_owner;
 	ReturnSetInfo *rsi;
@@ -751,6 +770,27 @@ typedef struct PLTSQL_execstate
 	int			found_varno;
 	int			ndatums;
 	PLTSQL_datum **datums;
+	/* context containing variable values (same as func's SPI_proc context) */
+	MemoryContext datum_context;
+
+	/*
+	 * paramLI is what we use to pass local variable values to the executor.
+	 * It does not have a ParamExternData array; we just dynamically
+	 * instantiate parameter data as needed.  By convention, PARAM_EXTERN
+	 * Params have paramid equal to the dno of the referenced local variable.
+	 */
+	ParamListInfo paramLI;
+
+	/* EState to use for "simple" expression evaluation */
+	EState	   *simple_eval_estate;
+
+	/* lookup table to use for executing type casts */
+	HTAB	   *cast_hash;
+	MemoryContext cast_hash_context;
+
+	/* memory context for statement-lifespan temporary values */
+	MemoryContext stmt_mcontext;	/* current stmt context, or NULL if none */
+	MemoryContext stmt_mcontext_parent; /* parent of current context */
 
 	/* temporary state for results from evaluation of query or expr */
 	SPITupleTable *eval_tuptable;
@@ -895,6 +935,8 @@ extern PLTSQL_variable *pltsql_build_variable(const char *refname, int lineno,
 					   bool add2namespace);
 extern PLTSQL_rec *pltsql_build_record(const char *refname, int lineno,
 					 bool add2namespace);
+extern PLTSQL_recfield *pltsql_build_recfield(PLTSQL_rec *rec,
+											  const char *fldname);
 extern int pltsql_recognize_err_condition(const char *condname,
 								bool allow_sqlstate);
 extern PLTSQL_condition *pltsql_parse_err_condition(char *condname);
@@ -916,7 +958,7 @@ extern Datum pltsql_validator(PG_FUNCTION_ARGS);
  * ----------
  */
 extern Datum pltsql_exec_function(PLTSQL_function *func,
-					  FunctionCallInfo fcinfo);
+								  FunctionCallInfo fcinfo, EState *simple_eval_estate);
 extern HeapTuple pltsql_exec_trigger(PLTSQL_function *func,
 					 TriggerData *trigdata);
 extern void pltsql_xact_cb(XactEvent event, void *arg);

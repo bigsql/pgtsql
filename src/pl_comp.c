@@ -30,8 +30,10 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 
 /* ----------
@@ -1422,14 +1424,11 @@ pltsql_parse_dblword(char *word1, char *word2,
 						 * datum whether it is or not --- any error will be
 						 * detected later.
 						 */
+						PLTSQL_rec *rec;
 						PLTSQL_recfield *new;
 
-						new = palloc(sizeof(PLTSQL_recfield));
-						new->dtype = PLTSQL_DTYPE_RECFIELD;
-						new->fieldname = pstrdup(word2);
-						new->recparentno = ns->itemno;
-
-						pltsql_adddatum((PLTSQL_datum *) new);
+						rec = (PLTSQL_rec *) (pltsql_Datums[ns->itemno]);
+						new = pltsql_build_recfield(rec, word2);
 
 						wdatum->datum = (PLTSQL_datum *) new;
 					}
@@ -1533,14 +1532,11 @@ pltsql_parse_tripword(char *word1, char *word2, char *word3,
 						 * words 1/2 are a record name, so third word could be
 						 * a field in this record.
 						 */
+						PLTSQL_rec *rec;
 						PLTSQL_recfield *new;
 
-						new = palloc(sizeof(PLTSQL_recfield));
-						new->dtype = PLTSQL_DTYPE_RECFIELD;
-						new->fieldname = pstrdup(word3);
-						new->recparentno = ns->itemno;
-
-						pltsql_adddatum((PLTSQL_datum *) new);
+						rec = (PLTSQL_rec *) (pltsql_Datums[ns->itemno]);
+						new = pltsql_build_recfield(rec, word3);
 
 						wdatum->datum = (PLTSQL_datum *) new;
 						wdatum->ident = NULL;
@@ -2079,6 +2075,46 @@ build_row_from_vars(PLTSQL_variable **vars, int numvars)
 	}
 
 	return row;
+}
+
+/*
+ * Build a RECFIELD datum for the named field of the specified record variable
+ *
+ * If there's already such a datum, just return it; we don't need duplicates.
+ */
+PLTSQL_recfield *
+pltsql_build_recfield(PLTSQL_rec *rec, const char *fldname)
+{
+	PLTSQL_recfield *recfield;
+	int			i;
+
+	/* search for an existing datum referencing this field */
+	i = rec->firstfield;
+	while (i >= 0)
+	{
+		PLTSQL_recfield *fld = (PLTSQL_recfield *) pltsql_Datums[i];
+
+		Assert(fld->dtype == PLTSQL_DTYPE_RECFIELD &&
+			   fld->recparentno == rec->dno);
+		if (strcmp(fld->fieldname, fldname) == 0)
+			return fld;
+		i = fld->nextfield;
+	}
+
+	/* nope, so make a new one */
+	recfield = palloc0(sizeof(PLTSQL_recfield));
+	recfield->dtype = PLTSQL_DTYPE_RECFIELD;
+	recfield->fieldname = pstrdup(fldname);
+	recfield->recparentno = rec->dno;
+	recfield->rectupledescid = INVALID_TUPLEDESC_IDENTIFIER;
+
+	pltsql_adddatum((PLTSQL_datum *) recfield);
+
+	/* now we can link it into the parent's chain */
+	recfield->nextfield = rec->firstfield;
+	rec->firstfield = recfield->dno;
+
+	return recfield;
 }
 
 /*

@@ -118,7 +118,7 @@ static	PLTSQL_stmt	*make_return_next_stmt(int location);
 static	PLTSQL_stmt	*make_return_query_stmt(int location);
 static	char			*NameOfDatum(PLwdatum *wdatum);
 static	void			 check_assignable(PLTSQL_datum *datum, int location);
-static	void			 read_into_target(PLTSQL_rec **rec, PLTSQL_row **row,
+static	void			 read_into_target(PLTSQL_variable **target,
 										  bool *strict);
 static	PLTSQL_row		*read_into_scalar_list(char *initial_name,
 											   PLTSQL_datum *initial_datum,
@@ -1880,8 +1880,7 @@ stmt_dynexecute : K_EXECUTE
 						new->query = expr;
 						new->into = false;
 						new->strict = false;
-						new->rec = NULL;
-						new->row = NULL;
+						new->target = NULL;
 						new->params = NIL;
 
 						/*
@@ -1898,7 +1897,7 @@ stmt_dynexecute : K_EXECUTE
 								if (new->into)			/* multiple INTO */
 									yyerror("syntax error");
 								new->into = true;
-								read_into_target(&new->rec, &new->row, &new->strict);
+								read_into_target(&new->target, &new->strict);
 								endtoken = yylex();
 							}
 							else if (endtoken == K_USING)
@@ -2006,11 +2005,10 @@ stmt_open		: K_OPEN cursor_variable
 stmt_fetch		: K_FETCH opt_fetch_direction cursor_variable K_INTO
 					{
 						PLTSQL_stmt_fetch *fetch = $2;
-						PLTSQL_rec	   *rec;
-						PLTSQL_row	   *row;
+						PLTSQL_variable *target;
 
 						/* We have already parsed everything through the INTO keyword */
-						read_into_target(&rec, &row, NULL);
+						read_into_target(&target, NULL);
 
 						if (yylex() != ';')
 							yyerror("syntax error");
@@ -2026,8 +2024,7 @@ stmt_fetch		: K_FETCH opt_fetch_direction cursor_variable K_INTO
 									 parser_errposition(@1)));
 
 						fetch->lineno = pltsql_location_to_lineno(@1);
-						fetch->rec		= rec;
-						fetch->row		= row;
+						fetch->target   = target;
 						fetch->curvar	= $3->dno;
 						fetch->is_move	= false;
 
@@ -2628,6 +2625,7 @@ read_sql_construct_bos(int until,
 	expr->query			= pstrdup(quote_tsql_identifiers(&ds, tsql_idents));
 	expr->plan			= NULL;
 	expr->paramnos		= NULL;
+	expr->rwparam		= -1;
 	expr->ns			= pltsql_ns_top();
 	pfree(ds.data);
 
@@ -2926,9 +2924,8 @@ make_execsql_stmt(int firsttoken, int location, PLword *firstword)
 	StringInfoData		ds;
 	IdentifierLookup	save_IdentifierLookup;
 	PLTSQL_stmt_execsql *execsql;
-	PLTSQL_expr		*expr;
-	PLTSQL_row			*row = NULL;
-	PLTSQL_rec			*rec = NULL;
+	PLTSQL_expr			*expr;
+	PLTSQL_variable		*target = NULL;
 	int					tok;
 	int					prev_tok;
 	bool				have_into = false;
@@ -2979,7 +2976,7 @@ make_execsql_stmt(int firsttoken, int location, PLword *firstword)
 			have_into = true;
 			into_start_loc = yylloc;
 			pltsql_IdentifierLookup = IDENTIFIER_LOOKUP_NORMAL;
-			read_into_target(&rec, &row, &have_strict);
+			read_into_target(&target, &have_strict);
 			pltsql_IdentifierLookup = IDENTIFIER_LOOKUP_EXPR;
 		}
 		/*
@@ -3042,6 +3039,7 @@ make_execsql_stmt(int firsttoken, int location, PLword *firstword)
 	expr->query			= pstrdup(quote_tsql_identifiers(&ds, tsql_idents));
 	expr->plan			= NULL;
 	expr->paramnos		= NULL;
+	expr->rwparam		= -1;
 	expr->ns			= pltsql_ns_top();
 	pfree(ds.data);
 
@@ -3061,8 +3059,7 @@ make_execsql_stmt(int firsttoken, int location, PLword *firstword)
 	execsql->sqlstmt = expr;
 	execsql->into	 = have_into;
 	execsql->strict	 = have_strict;
-	execsql->rec	 = rec;
-	execsql->row	 = row;
+	execsql->target	 = target;
 
 	return (PLTSQL_stmt *) execsql;
 }
@@ -3451,7 +3448,65 @@ check_assignable(PLTSQL_datum *datum, int location)
 			break;
 	}
 }
+#if 1
+/*
+ * Read the argument of an INTO clause.  On entry, we have just read the
+ * INTO keyword.
+ */
+static void
+read_into_target(PLTSQL_variable **target, bool *strict)
+{
+	int			tok;
 
+	/* Set default results */
+	*target = NULL;
+	if (strict)
+		*strict = false;
+
+	tok = yylex();
+	if (strict && tok == K_STRICT)
+	{
+		*strict = true;
+		tok = yylex();
+	}
+
+	/*
+	 * Currently, a row or record variable can be the single INTO target,
+	 * but not a member of a multi-target list.  So we throw error if there
+	 * is a comma after it, because that probably means the user tried to
+	 * write a multi-target list.  If this ever gets generalized, we should
+	 * probably refactor read_into_scalar_list so it handles all cases.
+	 */
+	switch (tok)
+	{
+		case T_DATUM:
+			if (yylval.wdatum.datum->dtype == PLTSQL_DTYPE_ROW ||
+				yylval.wdatum.datum->dtype == PLTSQL_DTYPE_REC)
+			{
+				check_assignable(yylval.wdatum.datum, yylloc);
+				*target = (PLTSQL_variable *) yylval.wdatum.datum;
+
+				if ((tok = yylex()) == ',')
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("record variable cannot be part of multiple-item INTO list"),
+							 parser_errposition(yylloc)));
+				pltsql_push_back_token(tok);
+			}
+			else
+			{
+				*target = (PLTSQL_variable *)
+					read_into_scalar_list(NameOfDatum(&(yylval.wdatum)),
+										  yylval.wdatum.datum, yylloc);
+			}
+			break;
+
+		default:
+			/* just to give a better message than "syntax error" */
+			current_token_is_not_variable(tok);
+	}
+}
+#else
 /*
  * Read the argument of an INTO clause.  On entry, we have just read the
  * INTO keyword.
@@ -3520,7 +3575,7 @@ read_into_target(PLTSQL_rec **rec, PLTSQL_row **row, bool *strict)
 			current_token_is_not_variable(tok);
 	}
 }
-
+#endif
 /*
  * Given the first datum and name in the INTO list, continue to read
  * comma-separated scalar variables until we run out. Then construct
@@ -3937,6 +3992,7 @@ read_cursor_args(PLTSQL_var *cursor, int until, const char *expected)
 	expr->query			= pstrdup(ds.data);
 	expr->plan			= NULL;
 	expr->paramnos		= NULL;
+	expr->rwparam		= -1;
 	expr->ns            = pltsql_ns_top();
 	pfree(ds.data);
 
