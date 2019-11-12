@@ -22,17 +22,17 @@ because it has unique conventions like:
 ## History of project
 This project was originally part of an OpenSCG  PostgreSQL distribution call tPostgres that 
 fizzled about seven years ago.  Five years ago Jim Mlodgenski ported it as a standalone extension
-for PG95 BigSQL.   Earlier in 2019 Denis Lussier upgraded it to suport PG 9.6 & PG 10.
-Now Korry Douglas is working to get it running properly with PG 11 (including support for stored 
-procedures instead of just stored functions) and then PG 12.
+for PG95 BigSQL.   Earlier in 2019 Denis Lussier upgraded it to build with PG 10.
+Now Korry Douglas is working on REL_3 for supportin PG 11+ (including support for stored 
+procedures instead of just stored functions).
 
 
 ## Installation
-Use the BigSQL command line to install PostgreSQL 10 and then the pgtsql extension
+Use the BigSQL command line to install PostgreSQL 11 and then the pgtsql extension
 
-	./apg install pg10
-  	./apg start pg10
-	./apg install pgtsql
+	./apg install pg11
+  	./apg start pg11
+	./apg install pgtsql-pg11
 
 
 ## Example
@@ -60,7 +60,7 @@ Now lets use psql to create a table and a small sample TSQL function as follows.
 
 ## Building from Source
 
-The "master" branch is for building against PG 10.
+The REL_3 branch is for building against PG 11.
 
 For installation there must be PostgreSQL dev environment installed
 and pg_config in the PATH.   Then just run:
