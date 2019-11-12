@@ -22,6 +22,7 @@
 #include "access/tuptoaster.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "executor/execExpr.h"
 #include "executor/spi_priv.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -256,6 +257,22 @@ static int exec_for_query(PLTSQL_execstate *estate, PLTSQL_stmt_forq *stmt,
 			   Portal portal, bool prefetch_ok);
 static ParamListInfo setup_param_list(PLTSQL_execstate *estate,
 				 PLTSQL_expr *expr);
+static ParamExternData *pltsql_param_fetch(ParamListInfo params,
+					int paramid, bool speculative,
+					ParamExternData *workspace);
+static void pltsql_param_compile(ParamListInfo params, Param *param,
+					  ExprState *state,
+					  Datum *resv, bool *resnull);
+static void pltsql_param_eval_var(ExprState *state, ExprEvalStep *op,
+					   ExprContext *econtext);
+static void pltsql_param_eval_var_ro(ExprState *state, ExprEvalStep *op,
+						  ExprContext *econtext);
+static void pltsql_param_eval_recfield(ExprState *state, ExprEvalStep *op,
+							ExprContext *econtext);
+static void pltsql_param_eval_generic(ExprState *state, ExprEvalStep *op,
+						   ExprContext *econtext);
+static void pltsql_param_eval_generic_ro(ExprState *state, ExprEvalStep *op,
+							  ExprContext *econtext);
 static void exec_move_row(PLTSQL_execstate *estate,
 			  PLTSQL_variable *target,
 			  HeapTuple tup, TupleDesc tupdesc);
@@ -3102,6 +3119,17 @@ pltsql_estate_setup(PLTSQL_execstate *estate,
 	estate->datums = palloc(sizeof(PLTSQL_datum *) * estate->ndatums);
 	/* caller is expected to fill the datums array */
 
+	/* inaitialize our ParamListInfo with appropriate hook functions */
+	estate->paramLI = (ParamListInfo)
+		palloc(offsetof(ParamListInfoData, params));
+	estate->paramLI->paramFetch = pltsql_param_fetch;
+	estate->paramLI->paramFetchArg = (void *) estate;
+	estate->paramLI->paramCompile = pltsql_param_compile;
+	estate->paramLI->paramCompileArg = NULL;	/* not needed */
+	estate->paramLI->parserSetup = (ParserSetupHook) pltsql_parser_setup;
+	estate->paramLI->parserSetupArg = NULL; /* filled during use */
+	estate->paramLI->numParams = estate->ndatums;
+
 	/* set up for use of appropriate simple-expression EState and cast hash */
 	if (simple_eval_estate)
 	{
@@ -5250,6 +5278,441 @@ setup_param_list(PLTSQL_execstate *estate, PLTSQL_expr *expr)
 		paramLI = NULL;
 	}
 	return paramLI;
+}
+
+/*
+ * plpgsql_param_fetch		paramFetch callback for dynamic parameter fetch
+ *
+ * We always use the caller's workspace to construct the returned struct.
+ *
+ * Note: this is no longer used during query execution.  It is used during
+ * planning (with speculative == true) and when the ParamListInfo we supply
+ * to the executor is copied into a cursor portal or transferred to a
+ * parallel child process.
+ */
+static ParamExternData *
+pltsql_param_fetch(ParamListInfo params,
+					int paramid, bool speculative,
+					ParamExternData *prm)
+{
+	int			dno;
+	PLTSQL_execstate *estate;
+	PLTSQL_expr *expr;
+	PLTSQL_datum *datum;
+	bool		ok = true;
+	int32		prmtypmod;
+
+	/* paramid's are 1-based, but dnos are 0-based */
+	dno = paramid - 1;
+	Assert(dno >= 0 && dno < params->numParams);
+
+	/* fetch back the hook data */
+	estate = (PLTSQL_execstate *) params->paramFetchArg;
+	expr = (PLTSQL_expr *) params->parserSetupArg;
+	Assert(params->numParams == estate->ndatums);
+
+	/* now we can access the target datum */
+	datum = estate->datums[dno];
+
+	/*
+	 * Since copyParamList() or SerializeParamList() will try to materialize
+	 * every single parameter slot, it's important to return a dummy param
+	 * when asked for a datum that's not supposed to be used by this SQL
+	 * expression.  Otherwise we risk failures in exec_eval_datum(), or
+	 * copying a lot more data than necessary.
+	 */
+	if (!bms_is_member(dno, expr->paramnos))
+		ok = false;
+
+	/*
+	 * If the access is speculative, we prefer to return no data rather than
+	 * to fail in exec_eval_datum().  Check the likely failure cases.
+	 */
+	else if (speculative)
+	{
+		switch (datum->dtype)
+		{
+			case PLTSQL_DTYPE_VAR:
+				/* always safe */
+				break;
+
+			case PLTSQL_DTYPE_ROW:
+				/* should be safe in all interesting cases */
+				break;
+
+			case PLTSQL_DTYPE_REC:
+				/* always safe (might return NULL, that's fine) */
+				break;
+
+			case PLTSQL_DTYPE_RECFIELD:
+				{
+					PLTSQL_recfield *recfield = (PLTSQL_recfield *) datum;
+					PLTSQL_rec *rec;
+
+					rec = (PLTSQL_rec *) (estate->datums[recfield->recparentno]);
+
+					/*
+					 * If record variable is NULL, don't risk anything.
+					 */
+					if (rec->erh == NULL)
+						ok = false;
+
+					/*
+					 * Look up the field's properties if we have not already,
+					 * or if the tuple descriptor ID changed since last time.
+					 */
+					else if (unlikely(recfield->rectupledescid != rec->erh->er_tupdesc_id))
+					{
+						if (expanded_record_lookup_field(rec->erh,
+														 recfield->fieldname,
+														 &recfield->finfo))
+							recfield->rectupledescid = rec->erh->er_tupdesc_id;
+						else
+							ok = false;
+					}
+					break;
+				}
+
+			default:
+				ok = false;
+				break;
+		}
+	}
+
+	/* Return "no such parameter" if not ok */
+	if (!ok)
+	{
+		prm->value = (Datum) 0;
+		prm->isnull = true;
+		prm->pflags = 0;
+		prm->ptype = InvalidOid;
+		return prm;
+	}
+
+	/* OK, evaluate the value and store into the return struct */
+	exec_eval_datum(estate, datum,
+					&prm->ptype, &prmtypmod,
+					&prm->value, &prm->isnull);
+	/* We can always mark params as "const" for executor's purposes */
+	prm->pflags = PARAM_FLAG_CONST;
+
+	/*
+	 * If it's a read/write expanded datum, convert reference to read-only,
+	 * unless it's safe to pass as read-write.
+	 */
+	if (dno != expr->rwparam)
+	{
+		if (datum->dtype == PLTSQL_DTYPE_VAR)
+			prm->value = MakeExpandedObjectReadOnly(prm->value,
+													prm->isnull,
+													((PLTSQL_var *) datum)->datatype->typlen);
+		else if (datum->dtype == PLTSQL_DTYPE_REC)
+			prm->value = MakeExpandedObjectReadOnly(prm->value,
+													prm->isnull,
+													-1);
+	}
+
+	return prm;
+}
+
+/*
+ * plpgsql_param_compile		paramCompile callback for plpgsql parameters
+ */
+static void
+pltsql_param_compile(ParamListInfo params, Param *param,
+					  ExprState *state,
+					  Datum *resv, bool *resnull)
+{
+	PLTSQL_execstate *estate;
+	PLTSQL_expr *expr;
+	int			dno;
+	PLTSQL_datum *datum;
+	ExprEvalStep scratch;
+
+	/* fetch back the hook data */
+	estate = (PLTSQL_execstate *) params->paramFetchArg;
+	expr = (PLTSQL_expr *) params->parserSetupArg;
+
+	/* paramid's are 1-based, but dnos are 0-based */
+	dno = param->paramid - 1;
+	Assert(dno >= 0 && dno < estate->ndatums);
+
+	/* now we can access the target datum */
+	datum = estate->datums[dno];
+
+	scratch.opcode = EEOP_PARAM_CALLBACK;
+	scratch.resvalue = resv;
+	scratch.resnull = resnull;
+
+	/*
+	 * Select appropriate eval function.  It seems worth special-casing
+	 * DTYPE_VAR and DTYPE_RECFIELD for performance.  Also, we can determine
+	 * in advance whether MakeExpandedObjectReadOnly() will be required.
+	 * Currently, only VAR/PROMISE and REC datums could contain read/write
+	 * expanded objects.
+	 */
+	if (datum->dtype == PLTSQL_DTYPE_VAR)
+	{
+		if (dno != expr->rwparam &&
+			((PLTSQL_var *) datum)->datatype->typlen == -1)
+			scratch.d.cparam.paramfunc = pltsql_param_eval_var_ro;
+		else
+			scratch.d.cparam.paramfunc = pltsql_param_eval_var;
+	}
+	else if (datum->dtype == PLTSQL_DTYPE_RECFIELD)
+		scratch.d.cparam.paramfunc = pltsql_param_eval_recfield;
+#ifdef PLTSQL_DTYPE_PROMISE
+	else if (datum->dtype == PLTSQL_DTYPE_PROMISE)
+	{
+		if (dno != expr->rwparam &&
+			((PLTSQL_var *) datum)->datatype->typlen == -1)
+			scratch.d.cparam.paramfunc = pltsql_param_eval_generic_ro;
+		else
+			scratch.d.cparam.paramfunc = pltsql_param_eval_generic;
+	}
+#endif
+	else if (datum->dtype == PLTSQL_DTYPE_REC &&
+			 dno != expr->rwparam)
+		scratch.d.cparam.paramfunc = pltsql_param_eval_generic_ro;
+	else
+		scratch.d.cparam.paramfunc = pltsql_param_eval_generic;
+
+	/*
+	 * Note: it's tempting to use paramarg to store the estate pointer and
+	 * thereby save an indirection or two in the eval functions.  But that
+	 * doesn't work because the compiled expression might be used with
+	 * different estates for the same PL/pgSQL function.
+	 */
+	scratch.d.cparam.paramarg = NULL;
+	scratch.d.cparam.paramid = param->paramid;
+	scratch.d.cparam.paramtype = param->paramtype;
+	ExprEvalPushStep(state, &scratch);
+}
+
+/*
+ * pltsql_param_eval_var		evaluation of EEOP_PARAM_CALLBACK step
+ *
+ * This is specialized to the case of DTYPE_VAR variables for which
+ * we do not need to invoke MakeExpandedObjectReadOnly.
+ */
+static void
+pltsql_param_eval_var(ExprState *state, ExprEvalStep *op,
+					   ExprContext *econtext)
+{
+	ParamListInfo params;
+	PLTSQL_execstate *estate;
+	int			dno = op->d.cparam.paramid - 1;
+	PLTSQL_var *var;
+
+	/* fetch back the hook data */
+	params = econtext->ecxt_param_list_info;
+	estate = (PLTSQL_execstate *) params->paramFetchArg;
+	Assert(dno >= 0 && dno < estate->ndatums);
+
+	/* now we can access the target datum */
+	var = (PLTSQL_var *) estate->datums[dno];
+	Assert(var->dtype == PLTSQL_DTYPE_VAR);
+
+	/* inlined version of exec_eval_datum() */
+	*op->resvalue = var->value;
+	*op->resnull = var->isnull;
+
+	/* safety check -- an assertion should be sufficient */
+	Assert(var->datatype->typoid == op->d.cparam.paramtype);
+}
+
+/*
+ * pltsql_param_eval_var_ro		evaluation of EEOP_PARAM_CALLBACK step
+ *
+ * This is specialized to the case of DTYPE_VAR variables for which
+ * we need to invoke MakeExpandedObjectReadOnly.
+ */
+static void
+pltsql_param_eval_var_ro(ExprState *state, ExprEvalStep *op,
+						  ExprContext *econtext)
+{
+	ParamListInfo params;
+	PLTSQL_execstate *estate;
+	int			dno = op->d.cparam.paramid - 1;
+	PLTSQL_var *var;
+
+	/* fetch back the hook data */
+	params = econtext->ecxt_param_list_info;
+	estate = (PLTSQL_execstate *) params->paramFetchArg;
+	Assert(dno >= 0 && dno < estate->ndatums);
+
+	/* now we can access the target datum */
+	var = (PLTSQL_var *) estate->datums[dno];
+	Assert(var->dtype == PLTSQL_DTYPE_VAR);
+
+	/*
+	 * Inlined version of exec_eval_datum() ... and while we're at it, force
+	 * expanded datums to read-only.
+	 */
+	*op->resvalue = MakeExpandedObjectReadOnly(var->value,
+											   var->isnull,
+											   -1);
+	*op->resnull = var->isnull;
+
+	/* safety check -- an assertion should be sufficient */
+	Assert(var->datatype->typoid == op->d.cparam.paramtype);
+}
+
+/*
+ * pltsql_param_eval_recfield		evaluation of EEOP_PARAM_CALLBACK step
+ *
+ * This is specialized to the case of DTYPE_RECFIELD variables, for which
+ * we never need to invoke MakeExpandedObjectReadOnly.
+ */
+static void
+pltsql_param_eval_recfield(ExprState *state, ExprEvalStep *op,
+							ExprContext *econtext)
+{
+	ParamListInfo params;
+	PLTSQL_execstate *estate;
+	int			dno = op->d.cparam.paramid - 1;
+	PLTSQL_recfield *recfield;
+	PLTSQL_rec *rec;
+	ExpandedRecordHeader *erh;
+
+	/* fetch back the hook data */
+	params = econtext->ecxt_param_list_info;
+	estate = (PLTSQL_execstate *) params->paramFetchArg;
+	Assert(dno >= 0 && dno < estate->ndatums);
+
+	/* now we can access the target datum */
+	recfield = (PLTSQL_recfield *) estate->datums[dno];
+	Assert(recfield->dtype == PLTSQL_DTYPE_RECFIELD);
+
+	/* inline the relevant part of exec_eval_datum */
+	rec = (PLTSQL_rec *) (estate->datums[recfield->recparentno]);
+	erh = rec->erh;
+
+	/*
+	 * If record variable is NULL, instantiate it if it has a named composite
+	 * type, else complain.  (This won't change the logical state of the
+	 * record: it's still NULL.)
+	 */
+	if (erh == NULL)
+	{
+		instantiate_empty_record_variable(estate, rec);
+		erh = rec->erh;
+	}
+
+	/*
+	 * Look up the field's properties if we have not already, or if the tuple
+	 * descriptor ID changed since last time.
+	 */
+	if (unlikely(recfield->rectupledescid != erh->er_tupdesc_id))
+	{
+		if (!expanded_record_lookup_field(erh,
+										  recfield->fieldname,
+										  &recfield->finfo))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("record \"%s\" has no field \"%s\"",
+							rec->refname, recfield->fieldname)));
+		recfield->rectupledescid = erh->er_tupdesc_id;
+	}
+
+	/* OK to fetch the field value. */
+	*op->resvalue = expanded_record_get_field(erh,
+											  recfield->finfo.fnumber,
+											  op->resnull);
+
+	/* safety check -- needed for, eg, record fields */
+	if (unlikely(recfield->finfo.ftypeid != op->d.cparam.paramtype))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("type of parameter %d (%s) does not match that when preparing the plan (%s)",
+						op->d.cparam.paramid,
+						format_type_be(recfield->finfo.ftypeid),
+						format_type_be(op->d.cparam.paramtype))));
+}
+
+/*
+ * pltsql_param_eval_generic		evaluation of EEOP_PARAM_CALLBACK step
+ *
+ * This handles all variable types, but assumes we do not need to invoke
+ * MakeExpandedObjectReadOnly.
+ */
+static void
+pltsql_param_eval_generic(ExprState *state, ExprEvalStep *op,
+						   ExprContext *econtext)
+{
+	ParamListInfo params;
+	PLTSQL_execstate *estate;
+	int			dno = op->d.cparam.paramid - 1;
+	PLTSQL_datum *datum;
+	Oid			datumtype;
+	int32		datumtypmod;
+
+	/* fetch back the hook data */
+	params = econtext->ecxt_param_list_info;
+	estate = (PLTSQL_execstate *) params->paramFetchArg;
+	Assert(dno >= 0 && dno < estate->ndatums);
+
+	/* now we can access the target datum */
+	datum = estate->datums[dno];
+
+	/* fetch datum's value */
+	exec_eval_datum(estate, datum,
+					&datumtype, &datumtypmod,
+					op->resvalue, op->resnull);
+
+	/* safety check -- needed for, eg, record fields */
+	if (unlikely(datumtype != op->d.cparam.paramtype))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("type of parameter %d (%s) does not match that when preparing the plan (%s)",
+						op->d.cparam.paramid,
+						format_type_be(datumtype),
+						format_type_be(op->d.cparam.paramtype))));
+}
+
+/*
+ * pltsql_param_eval_generic_ro	evaluation of EEOP_PARAM_CALLBACK step
+ *
+ * This handles all variable types, but assumes we need to invoke
+ * MakeExpandedObjectReadOnly (hence, variable must be of a varlena type).
+ */
+static void
+pltsql_param_eval_generic_ro(ExprState *state, ExprEvalStep *op,
+							  ExprContext *econtext)
+{
+	ParamListInfo params;
+	PLTSQL_execstate *estate;
+	int			dno = op->d.cparam.paramid - 1;
+	PLTSQL_datum *datum;
+	Oid			datumtype;
+	int32		datumtypmod;
+
+	/* fetch back the hook data */
+	params = econtext->ecxt_param_list_info;
+	estate = (PLTSQL_execstate *) params->paramFetchArg;
+	Assert(dno >= 0 && dno < estate->ndatums);
+
+	/* now we can access the target datum */
+	datum = estate->datums[dno];
+
+	/* fetch datum's value */
+	exec_eval_datum(estate, datum,
+					&datumtype, &datumtypmod,
+					op->resvalue, op->resnull);
+
+	/* safety check -- needed for, eg, record fields */
+	if (unlikely(datumtype != op->d.cparam.paramtype))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("type of parameter %d (%s) does not match that when preparing the plan (%s)",
+						op->d.cparam.paramid,
+						format_type_be(datumtype),
+						format_type_be(op->d.cparam.paramtype))));
+
+	/* force the value to read-only */
+	*op->resvalue = MakeExpandedObjectReadOnly(*op->resvalue,
+											   *op->resnull,
+											   -1);
 }
 
 /*
