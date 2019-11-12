@@ -1788,24 +1788,15 @@ stmt_print		: K_PRINT
 						if (tok == ';')
 							yyerror("Incorrect syntax");
 
-						/*
-						 * We expect only one parameter: either a string
-						 * literal, a local variable or a global variable.
-						 */
-						if (tok == SCONST)
-							new->message = yylval.str;
-						else if (tok == T_DATUM)
-						{
-							pltsql_push_back_token(tok);
+						pltsql_push_back_token(tok);
 
-							new->message = "%";
-							expr = read_sql_construct_bos(';', 0, 0,
+						new->message = "%";
+						expr = read_sql_construct_bos(';', 0, 0,
 													  " ",
 													  "SELECT ",
 													  true, true, true,
 													  NULL, &tok, true);
-							new->params = lappend(new->params, expr);
-						}
+						new->params = lappend(new->params, expr);
 
 						/*
 						 * Make semicolon statement termination optional.
