@@ -22,8 +22,8 @@ because it has unique conventions like:
 ## History of project
 This project was originally part of an OpenSCG  PostgreSQL distribution call tPostgres that 
 fizzled about seven years ago.  Five years ago Jim Mlodgenski ported it as a standalone extension
-for PG95 BigSQL.   Earlier in 2019 Denis Lussier upgraded it to build with PG 10.
-Now Korry Douglas is working on REL_3 for supportin PG 11+ (including support for stored 
+for PG9.5 BigSQL.   Early in 2019 Denis Lussier upgraded it to build with PG10. 
+In late 2019 Korry Douglas upgraded it for PG11 support in v3.0 (including support for stored 
 procedures instead of just stored functions).
 
 
