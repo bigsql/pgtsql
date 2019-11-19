@@ -8,7 +8,7 @@
 
 EXTENSION = pgtsql
 
-DISTVERSION = 2.0
+DISTVERSION = 3.0
 
 PG_CONFIG = pg_config
 PQINCSERVER = $(shell $(PG_CONFIG) --includedir-server)
@@ -19,7 +19,7 @@ MODULE_big = $(EXTENSION)
 OBJS = src/pl_gram.o src/pl_handler.o src/pl_comp.o src/pl_exec.o \
 	src/pl_funcs.o src/pl_scanner.o
 
-DATA = pgtsql.control sql/pgtsql--2.0.sql 
+DATA = pgtsql.control sql/pgtsql--3.0.sql 
 
 TESTS = $(wildcard test/sql/*.sql)
 REGRESS_OPTS = --dbname=regression --inputdir=test --load-extension=$(EXTENSION)

@@ -154,8 +154,6 @@ LANGUAGE SQL;
 GRANT EXECUTE ON FUNCTION sys.isnull(timestamp with time zone,timestamp with time zone) TO PUBLIC;
 
 
-
-
 /* PL/TSQL procedural language */
 
 CREATE FUNCTION pltsql_call_handler ()
